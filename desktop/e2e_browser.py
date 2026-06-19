@@ -59,17 +59,10 @@ def main() -> int:
         browser = p.chromium.launch()
         page = browser.new_page()
         page.set_default_timeout(60000)
-        out_dir = tempfile.mkdtemp(prefix="rt_e2e_out_")
         print(f"[e2e] opening {BASE_URL}")
         page.goto(BASE_URL, wait_until="domcontentloaded")
         # app header
         expect(page.get_by_text("Ribbon Issue Tracker").first).to_be_visible()
-
-        # route auto-save to a temp dir (also exercises the 'Save reports to'
-        # field) so the test never pollutes the real reports folder
-        save_field = page.get_by_label("Save reports to")
-        save_field.fill(out_dir)
-        save_field.press("Enter")
 
         # UPLOAD through the real uploader (hidden <input type=file>, multiple)
         print("[e2e] uploading 2 reports")
@@ -91,17 +84,24 @@ def main() -> int:
     assert "Reports loaded" in body, "metrics missing"
     assert "Repeat offender" in body and "Ribbon 1" in body, "repeat-offender wrong"
 
-    # confirm a report was actually written to the temp out dir
-    import glob
-    saved_files = glob.glob(os.path.join(out_dir, "*.xlsx"))
-    if not saved_files:
-        print(f"[e2e] FAIL — no .xlsx auto-saved into {out_dir}")
+    # the UI prints the saved path; verify that exact file exists + is valid
+    m = re.search(r"Report saved:\s*`?(.+?\.xlsx)`?", body, re.S)
+    if not m:
+        print("[e2e] FAIL — no 'Report saved' path on the page")
         return 1
-    saved = saved_files[0]
-    # it must be a valid workbook with the 3 expected sheets
+    saved = m.group(1).strip().strip("`").strip()
+    if not os.path.exists(saved):
+        print(f"[e2e] FAIL — saved report not found on disk: {saved}")
+        return 1
     wb = openpyxl.load_workbook(saved)
-    if wb.sheetnames != ["Ribbon Ranking", "All Events", "Reports Loaded"]:
-        print(f"[e2e] FAIL — unexpected sheets: {wb.sheetnames}")
+    sheets = wb.sheetnames
+    # clean up so the test never leaves a file in the user's reports folder
+    try:
+        os.remove(saved)
+    except OSError:
+        pass
+    if sheets != ["Ribbon Ranking", "All Events", "Reports Loaded"]:
+        print(f"[e2e] FAIL — unexpected sheets: {sheets}")
         return 1
     print(f"[e2e] OK — report auto-saved + valid: {os.path.basename(saved)}")
     print(f"[e2e] screenshot: {SHOT}")
