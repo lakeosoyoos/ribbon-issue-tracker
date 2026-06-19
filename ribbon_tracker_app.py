@@ -103,10 +103,22 @@ def pick_folder_native() -> str:
 # --------------------------------------------------------------------------- #
 @st.cache_data(show_spinner=False)
 def _parse_bytes(name: str, data: bytes) -> dict:
-    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=True) as tf:
-        tf.write(data)
-        tf.flush()
-        rp = parse_report(tf.name)
+    # Write to a temp DIR then load — not a NamedTemporaryFile reopened by
+    # name, which raises PermissionError on Windows (the file is still open
+    # and Windows won't let openpyxl reopen a locked handle). Preserve the
+    # original .xlsx name so parse_report's route/report stem stays correct.
+    import shutil
+    tmpdir = tempfile.mkdtemp(prefix="ribbon_")
+    try:
+        safe = Path(name).name or "report.xlsx"
+        if not safe.lower().endswith(".xlsx"):
+            safe += ".xlsx"
+        fpath = os.path.join(tmpdir, safe)
+        with open(fpath, "wb") as fh:
+            fh.write(data)
+        rp = parse_report(fpath)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
     return {
         "report": rp.report,
         "route": rp.route,
