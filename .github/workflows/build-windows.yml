@@ -194,6 +194,57 @@ jobs:
           }
           Write-Host "BOOT SELF-TEST PASSED."
 
+      # ── BROWSER END-TO-END (the human click-through, automated) ─────
+      # Drives a headless Chromium through the exact flow a tech performs
+      # against the FROZEN exe's browser UI: upload two reports -> wait for
+      # metrics + ribbon ranking + repeat-offender callout to render ->
+      # confirm a timestamped Excel auto-saved + opens. This is the gate that
+      # proves the whole upload->analyze->chart->save round-trip works in the
+      # browser served by the build a tech downloads — not just that the
+      # libraries import. Screenshot uploaded as an artifact.
+      - name: Install Playwright + Chromium
+        run: |
+          pip install playwright
+          python -m playwright install chromium
+
+      - name: Browser end-to-end (upload -> charts -> save, frozen exe)
+        shell: pwsh
+        env:
+          PYTHONIOENCODING: utf-8
+        run: |
+          $exe = "dist\RibbonTracker\RibbonTracker.exe"
+          $proc = Start-Process -FilePath $exe -PassThru
+          $ok = $false
+          for ($i = 0; $i -lt 45; $i++) {
+            Start-Sleep -Seconds 2
+            try {
+              $r = Invoke-WebRequest -Uri "http://127.0.0.1:8512/_stcore/health" -UseBasicParsing -TimeoutSec 2
+              if ($r.Content.Trim() -eq "ok") { $ok = $true; break }
+            } catch { }
+          }
+          if (-not $ok) {
+            if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+            Write-Error "BROWSER E2E FAILED — exe never served health for the browser test."
+            exit 1
+          }
+          python e2e_browser.py "http://127.0.0.1:8512" "e2e_browser.png"
+          $rc = $LASTEXITCODE
+          if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+          Get-Process -Name "RibbonTracker" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          if ($rc -ne 0) {
+            Write-Error "BROWSER E2E FAILED (exit $rc) — see log above. Release will NOT be updated."
+            exit 1
+          }
+          Write-Host "BROWSER E2E PASSED."
+
+      - name: Upload E2E screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: RibbonTracker-E2E-screenshot
+          path: desktop/e2e_browser.png
+          retention-days: 14
+
       - name: Zip the dist folder
         shell: pwsh
         run: |
