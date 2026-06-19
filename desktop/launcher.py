@@ -280,6 +280,13 @@ def _selftest() -> int:
         ribbon_parser = importlib.import_module("ribbon_parser")
         _ok("import: ribbon_parser (bundled engine)")
 
+        # tkinter backs the Browse folder/zip pickers — confirm it's bundled.
+        # Import only (no Tk() — CI has no display); a missing module here means
+        # the Browse buttons would be dead on a tech's machine.
+        import tkinter            # noqa: F401
+        from tkinter import filedialog  # noqa: F401
+        _ok("import: tkinter + filedialog (Browse pickers)")
+
         # 1) openpyxl WRITE: build a synthetic report workbook
         tmp = Path(tempfile.mkdtemp(prefix="rt_selftest_"))
         rep = tmp / "report.xlsx"
