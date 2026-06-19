@@ -36,8 +36,12 @@ portable equivalent.
 - **Ribbon ranking** — repeat offenders first, with per-category breakdown.
 - **Charts** — events per ribbon, ribbon × category heatmap, issue mix.
 - **All events** — every flagged cell, filterable by route / category.
-- **Download** — a `ribbon_issue_tracker.xlsx` with Ranking + All Events +
-  Reports Loaded sheets.
+- **Auto-saved report** — each time a new set of reports is analyzed, a
+  timestamped `Ribbon Issue Tracker YYYY-MM-DD_HH-MM-SS.xlsx` is written to
+  `~/Desktop/Ribbon Tracker Reports/` (change the folder, or turn auto-save off,
+  in the sidebar). Written once per distinct analysis, not on every click.
+- **Download** — the same timestamped workbook on demand, with Ranking +
+  All Events + Reports Loaded sheets.
 
 ## Files
 - `ribbon_parser.py` — parsing + classification engine (no Streamlit; scriptable

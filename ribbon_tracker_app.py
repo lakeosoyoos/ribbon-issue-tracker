@@ -204,6 +204,24 @@ def build_export(df_events, df_rollup, df_reports) -> bytes:
     return buf.getvalue()
 
 
+def _stamp() -> str:
+    """Filename-safe local timestamp — no colons (illegal on Windows)."""
+    from datetime import datetime
+    return datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+
+def _report_filename() -> str:
+    return f"Ribbon Issue Tracker {_stamp()}.xlsx"
+
+
+def _default_out_dir() -> Path:
+    """Where auto-saved reports land by default: ~/Desktop/Ribbon Tracker Reports
+    (falls back to the home dir if there's no Desktop)."""
+    desktop = Path.home() / "Desktop"
+    base = desktop if desktop.is_dir() else Path.home()
+    return base / "Ribbon Tracker Reports"
+
+
 # --------------------------------------------------------------------------- #
 # UI
 # --------------------------------------------------------------------------- #
@@ -249,6 +267,18 @@ with st.sidebar:
         options=list(CATEGORIES.keys()),
         default=list(CATEGORIES.keys()),
         format_func=lambda k: cat_labels[k],
+    )
+
+    st.divider()
+    st.markdown("**Report output**")
+    autosave = st.checkbox(
+        "Auto-save a timestamped Excel report", value=True,
+        help="Writes a dated .xlsx to the folder below each time a new set of "
+             "reports is analyzed.",
+    )
+    out_dir = st.text_input(
+        "Save reports to", value=str(_default_out_dir()),
+        help="Folder where auto-saved reports are written (created if missing).",
     )
 
 # ---- gather inputs ----
@@ -454,9 +484,36 @@ xlsx = build_export(
                "splice", "category_label", "text"]],
     df_rollup, df_reports,
 )
+
+# Auto-save a timestamped report — but only ONCE per distinct analysis, not on
+# every Streamlit rerun (clicks/filters trigger reruns). We fingerprint the
+# inputs + category selection; when that signature changes we write a new file.
+def _analysis_signature() -> str:
+    import hashlib
+    key = "|".join(sorted(p["report"] for p in parsed))
+    key += f"::events={len(df_events)}::cats={','.join(sorted(chosen))}"
+    return hashlib.md5(key.encode()).hexdigest()
+
+if autosave:
+    sig = _analysis_signature()
+    if st.session_state.get("_last_saved_sig") != sig:
+        try:
+            target_dir = Path(out_dir.strip() or str(_default_out_dir())).expanduser()
+            target_dir.mkdir(parents=True, exist_ok=True)
+            saved_path = target_dir / _report_filename()
+            saved_path.write_bytes(xlsx)
+            st.session_state["_last_saved_sig"] = sig
+            st.session_state["_last_saved_path"] = str(saved_path)
+        except Exception as exc:  # noqa: BLE001
+            st.warning(f"Could not auto-save the report: {exc}")
+            report_error(exc, where="auto_save_report",
+                         context={"out_dir": out_dir})
+    if st.session_state.get("_last_saved_path"):
+        st.success(f"📄 Report saved: `{st.session_state['_last_saved_path']}`")
+
 st.download_button(
     "⬇️  Download cross-report tracker (.xlsx)",
     data=xlsx,
-    file_name="ribbon_issue_tracker.xlsx",
+    file_name=_report_filename(),
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 )
