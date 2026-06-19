@@ -558,7 +558,12 @@ with tab_reports:
     st.dataframe(df_reports, width="stretch", hide_index=True)
     for p in parsed:
         if p["summary_stats"]:
-            with st.expander(f"Tech's Reburn Summary — {p['report']}"):
+            with st.expander(f"Report's embedded Reburn Summary — {p['report']}"):
+                st.caption(
+                    "This is the summary block stored inside the report by the "
+                    "generator. It may predate manual edits a tech made to the "
+                    "grid afterward — the tool's own counts above come from the "
+                    "live grid, not this block.")
                 st.json(p["summary_stats"])
 
 # ---- export ----

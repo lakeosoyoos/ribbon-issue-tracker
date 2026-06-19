@@ -28,8 +28,9 @@ if _ROOT not in sys.path:
 
 from ribbon_parser import parse_report  # noqa: E402
 
-PINK = PatternFill("solid", fgColor="FFC7CE")   # A+B reburn
-YELLOW = PatternFill("solid", fgColor="FFEB3B")  # bend
+PINK = PatternFill("solid", fgColor="FFC7CE")   # A+B reburn (Legend swatch)
+YELLOW = PatternFill("solid", fgColor="FFEB3B")  # bend (Legend swatch)
+OFFPAL = PatternFill("solid", fgColor="9DB3D7")  # off-Legend tint (theme-ish)
 
 
 def _make_synthetic(path: str) -> None:
@@ -60,6 +61,10 @@ def _make_synthetic(path: str) -> None:
     c.fill = PINK
     c = sr.cell(6, 5, "30 BEND .112 bidi")  # ribbon 3, Splice 2 — bend
     c.fill = YELLOW
+    # ribbon 2, Splice 1 — bare loss value with an off-Legend tint:
+    # must be 'uncategorized', never guessed.
+    c = sr.cell(5, 3, "13 .205")
+    c.fill = OFFPAL
 
     lg = wb.create_sheet("Legend")
     lg["A1"] = "Color"; lg["B1"] = "Meaning"
@@ -76,17 +81,22 @@ def test_parser_finds_grid_and_classifies():
 
     assert rp.grid_sheet == "Splice Report", rp.grid_sheet
     assert rp.n_ribbons == 3, rp.n_ribbons
-    assert len(rp.events) == 2, [e.text for e in rp.events]
+    assert len(rp.events) == 3, [e.text for e in rp.events]
 
     by_ribbon = {e.ribbon_num: e for e in rp.events}
     reburn = by_ribbon[1]
     assert reburn.tube == "A1"
-    assert reburn.category == "reburn_ab", reburn.category
+    assert reburn.category == "reburn_ab", reburn.category   # exact Legend pink
     assert reburn.splice == "Splice 1"
 
     bend = by_ribbon[3]
     assert bend.tube == "B1"
-    assert bend.category == "bend", bend.category
+    assert bend.category == "bend", bend.category            # text token
+
+    # off-Legend tinted bare loss -> uncategorized, NOT a guessed type
+    uncat = by_ribbon[2]
+    assert uncat.tube == "A2"
+    assert uncat.category == "uncategorized", uncat.category
 
 
 if __name__ == "__main__":

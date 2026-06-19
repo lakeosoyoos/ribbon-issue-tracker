@@ -45,34 +45,38 @@ CATEGORIES = {
     "a_only":       "A-only (single-dir)",
     "b_only":       "B-only (single-dir)",
     "dead_zone":    "Dead zone",
-    "other":        "Other flagged",
+    "uncategorized": "Flagged — loss (uncategorized)",
 }
 
-# Last-6-hex fill color -> category, for cells whose text has no type token
-# (a bare "fiber# .loss").  Derived from the Legend sheet.
-COLOR_TO_CATEGORY = {
-    "ffc7ce": "reburn_ab",   # Pink     - A+B bidirectional reburn
-    "ffeb3b": "bend",        # Material yellow - BEND
-    "ffff00": "bend",        # Pure yellow     - BEND
-    "ffa500": "launch",      # Orange   - LAUNCH
-    "ff9c27": "launch",
-    "c6efce": "gainer",      # Mint green - field gainer
-    "a9d08e": "gainer",
+# Authoritative color -> category map, taken from the report's Legend swatches
+# (exact RGBs, verified against the Legend sheet). A bare "fiber# .loss" cell
+# (no text token) is only given a category when its fill EXACTLY matches one of
+# these. Anything else — a theme-tinted fill a tech applied by hand, or an
+# off-palette color — is left "uncategorized" rather than guessed, so the tool
+# never asserts a type its evidence can't support.
+LEGEND_SWATCHES = {
+    "ffc7ce": "reburn_ab",   # Pink        - A+B bidirectional reburn
+    "ff4444": "break",       # Red         - break / broke
+    "e64a19": "ref",         # Deep orange - reflective event
+    "bdd7ee": "b_fill",      # Lt. blue    - B-fill (single-dir)
+    "bfbfbf": "dead_zone",   # Gray        - dead zone
+    "fff2cc": "a_only",      # Lt. yellow  - A-only (single-dir)
+    "e8d5f5": "b_only",      # Lavender    - B-only (single-dir)
+    "ffeb3b": "bend",        # Yellow      - BEND
+    "ffff00": "bend",        # Pure yellow - BEND (variant)
+    "ffa500": "launch",      # Orange      - LAUNCH
+    "a5d6a7": "gainer",      # Mint green  - field gainer
 }
 
-# Theme-indexed fills observed in the wild (theme, rounded-tint) -> category.
-# theme 4 (accent1, blue) light tint  -> B-fill (light blue)
-# theme 3 (lt2)           light tint  -> A-only / lavender / dead-zone family
-THEME_TINT_TO_CATEGORY = {
-    (4, 0.4): "b_fill",
-    (4, 0.6): "b_fill",
-    (3, 0.6): "a_only",
-    (3, 0.4): "a_only",
-}
+# How close an explicit-RGB fill must be to a Legend swatch to count as that
+# category (squared euclidean over 0-255 channels). Tight enough that a
+# hand-applied theme tint (which resolves far from every swatch) never matches.
+_COLOR_TOL2 = 18 ** 2
 
 
 def _color_key(fill) -> Optional[str]:
-    """Return a normalized 6-char lowercase hex for a solid fill, or None."""
+    """Return a normalized 6-char lowercase hex for an EXPLICIT-rgb solid fill,
+    or None (theme-colored fills return None — we don't trust resolved tints)."""
     if fill is None or fill.patternType is None:
         return None
     fg = fill.fgColor
@@ -84,24 +88,30 @@ def _color_key(fill) -> Optional[str]:
     return None
 
 
-def _theme_key(fill):
-    if fill is None or fill.patternType is None:
-        return None
-    fg = fill.fgColor
+def _match_legend(hex6: str) -> Optional[str]:
+    """Exact match, then nearest Legend swatch within a tight tolerance."""
+    if hex6 in LEGEND_SWATCHES:
+        return LEGEND_SWATCHES[hex6]
     try:
-        if fg.type == "theme":
-            return (int(fg.theme), round(float(fg.tint or 0.0), 1))
-    except Exception:
-        pass
-    return None
+        r, g, b = int(hex6[0:2], 16), int(hex6[2:4], 16), int(hex6[4:6], 16)
+    except ValueError:
+        return None
+    best, best_d = None, None
+    for sw, cat in LEGEND_SWATCHES.items():
+        sr, sg, sb = int(sw[0:2], 16), int(sw[2:4], 16), int(sw[4:6], 16)
+        d = (r - sr) ** 2 + (g - sg) ** 2 + (b - sb) ** 2
+        if best_d is None or d < best_d:
+            best, best_d = cat, d
+    return best if (best_d is not None and best_d <= _COLOR_TOL2) else None
 
 
 def classify_cell(value: str, fill) -> str:
-    """Classify a flagged grid cell into a CATEGORIES key using text first,
-    then fill color, then theme color."""
+    """Classify a flagged grid cell. Certain signals only: a text token, or a
+    fill that exactly matches a Legend swatch. A bare loss value with a
+    non-Legend / theme color -> 'uncategorized' (counted, never mislabeled)."""
     t = str(value).lower()
 
-    # --- text tokens (most reliable) ---
+    # --- text tokens (authoritative) ---
     if "bend" in t:
         return "bend"
     if "broke" in t or "break" in t:
@@ -123,19 +133,15 @@ def classify_cell(value: str, fill) -> str:
     if "bidi" in t:
         return "reburn_ab"
 
-    # --- bare "fiber# .loss" cells: lean on color ---
+    # --- bare "fiber# .loss" cells: only an EXACT Legend-swatch color counts ---
     ck = _color_key(fill)
-    if ck and ck in COLOR_TO_CATEGORY:
-        return COLOR_TO_CATEGORY[ck]
-    tk = _theme_key(fill)
-    if tk and tk in THEME_TINT_TO_CATEGORY:
-        return THEME_TINT_TO_CATEGORY[tk]
+    if ck:
+        cat = _match_legend(ck)
+        if cat:
+            return cat
 
-    # A pink-filled bare numeric is the classic averaged A+B reburn.
-    if ck == "ffc7ce":
-        return "reburn_ab"
-
-    return "other"
+    # Theme-tinted or off-palette fill with no token: don't guess.
+    return "uncategorized"
 
 
 # --------------------------------------------------------------------------- #
