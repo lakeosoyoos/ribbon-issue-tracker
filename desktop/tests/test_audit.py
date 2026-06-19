@@ -254,6 +254,31 @@ def audit_autosave_and_clean():
         check("auto-save OFF writes nothing", len(files) == 0, str(files))
 
 
+def audit_spaces():
+    print("\n[8] Spaces in filenames, folder paths, and the output dir")
+    base = tempfile.mkdtemp()
+    folder = os.path.join(base, "Seattle to North Bend Reports")
+    sub = os.path.join(folder, "Sub Folder With Spaces")
+    os.makedirs(sub)
+    make_report(os.path.join(folder, "SEA to N BEN Reburn 2.0 ZK.xlsx"),
+                [(4, 3, "5 .312", PINK)])
+    make_report(os.path.join(sub, "PENPRO OOS Report Final v2.xlsx"),
+                [(5, 5, "13 .288", PINK)])
+    out = os.path.join(base, "My Saved Reports Folder")   # not pre-created
+    at = run_app(folder=folder, out_dir=out)
+    labels = {m.label: m.value for m in at.metric}
+    check("0 exceptions with spaced folder + filenames",
+          len(at.exception) == 0, str([e.value for e in at.exception]))
+    check("both spaced-name reports loaded from spaced folder/subfolder",
+          labels.get("Reports loaded") == "2", str(labels))
+    saved = glob.glob(os.path.join(out, "*.xlsx"))
+    check("report auto-saved into a spaced output dir (auto-created)",
+          len(saved) == 1, str(saved))
+    check("output filename itself contains spaces",
+          bool(saved) and " " in os.path.basename(saved[0]),
+          str(saved))
+
+
 def main():
     print("=" * 70)
     print("RIBBON TRACKER — full click-through + ingestion audit")
@@ -265,6 +290,7 @@ def main():
     audit_duplicate_names()
     audit_tabs_and_filters()
     audit_autosave_and_clean()
+    audit_spaces()
     print("\n" + "=" * 70)
     print(f"RESULT: {len(_PASS)} passed, {len(_FAIL)} failed")
     if _FAIL:
