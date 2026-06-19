@@ -56,11 +56,15 @@ ACTION_CATS = {"reburn_ab", "break", "ref", "launch", "bend", "gainer"}
 # --------------------------------------------------------------------------- #
 # Input helpers
 # --------------------------------------------------------------------------- #
+_REPORT_EXTS = (".xlsx", ".xlsm")
+
+
 def _is_report_member(name: str) -> bool:
-    """A real .xlsx inside a zip / folder (skip Excel lock files & macOS junk)."""
-    base = name.rsplit("/", 1)[-1]
+    """A real report workbook inside a zip / folder (skip Excel lock files &
+    macOS junk). Extension match is case-insensitive so FOO.XLSX loads too."""
+    base = name.replace("\\", "/").rsplit("/", 1)[-1]
     return (
-        name.lower().endswith(".xlsx")
+        name.lower().endswith(_REPORT_EXTS)
         and not base.startswith("~$")
         and "__MACOSX" not in name
         and not base.startswith(".")
@@ -105,18 +109,19 @@ def pick_folder_native() -> str:
 def _parse_bytes(name: str, data: bytes) -> dict:
     # Write to a temp DIR then load — not a NamedTemporaryFile reopened by
     # name, which raises PermissionError on Windows (the file is still open
-    # and Windows won't let openpyxl reopen a locked handle). Preserve the
-    # original .xlsx name so parse_report's route/report stem stays correct.
+    # and Windows won't let openpyxl reopen a locked handle).
+    #
+    # The on-disk temp name is a FIXED, OS-safe constant ("report.xlsx") so we
+    # can ingest a report no matter what characters its real filename contains
+    # (unicode, spaces, colons from zip entries, reserved Windows names, etc.).
+    # The real name is passed to parse_report as report_name purely for display.
     import shutil
     tmpdir = tempfile.mkdtemp(prefix="ribbon_")
     try:
-        safe = Path(name).name or "report.xlsx"
-        if not safe.lower().endswith(".xlsx"):
-            safe += ".xlsx"
-        fpath = os.path.join(tmpdir, safe)
+        fpath = os.path.join(tmpdir, "report.xlsx")
         with open(fpath, "wb") as fh:
             fh.write(data)
-        rp = parse_report(fpath)
+        rp = parse_report(fpath, report_name=Path(str(name)).stem)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
     return {
@@ -222,6 +227,19 @@ def _default_out_dir() -> Path:
     return base / "Ribbon Tracker Reports"
 
 
+def _unique_path(target: Path) -> Path:
+    """Avoid clobbering if two analyses land in the same second."""
+    if not target.exists():
+        return target
+    stem, suffix = target.stem, target.suffix
+    i = 2
+    while True:
+        cand = target.with_name(f"{stem} ({i}){suffix}")
+        if not cand.exists():
+            return cand
+        i += 1
+
+
 # --------------------------------------------------------------------------- #
 # UI
 # --------------------------------------------------------------------------- #
@@ -283,30 +301,51 @@ with st.sidebar:
 
 # ---- gather inputs ----
 inputs: list[tuple[str, bytes]] = []
-seen = set()
+_seen_hashes: set[str] = set()
+_used_names: dict[str, int] = {}
 
 def _add(name: str, data: bytes):
-    if name in seen:
+    import hashlib
+    # Exact-duplicate guard: the SAME file loaded twice (e.g. uploaded and also
+    # in the scanned folder) is counted once, by content — not by name.
+    h = hashlib.md5(data).hexdigest()
+    if h in _seen_hashes:
         return
-    inputs.append((name, data))
-    seen.add(name)
+    _seen_hashes.add(h)
+    # Distinct files that happen to share a filename both load — disambiguate
+    # the display name so the cross-report count stays correct.
+    orig = str(name)
+    n = _used_names.get(orig, 0) + 1
+    _used_names[orig] = n
+    if n == 1:
+        label = orig
+    else:
+        stem, ext = os.path.splitext(orig)
+        label = f"{stem} ({n}){ext}"
+    inputs.append((label, data))
 
 for uf in uploads or []:
     if uf.name.lower().endswith(".zip"):
         members = _xlsx_from_zip(uf.getvalue())
         if not members:
-            st.sidebar.warning(f"No .xlsx reports found inside {uf.name}")
+            st.sidebar.warning(f"No report files (.xlsx/.xlsm) found inside {uf.name}")
         for mname, mdata in members:
             _add(mname, mdata)
-    else:
+    elif uf.name.lower().endswith(_REPORT_EXTS):
         _add(uf.name, uf.getvalue())
+    else:
+        st.sidebar.warning(f"Skipped {uf.name} — not a report (.xlsx/.xlsm/.zip).")
 
 if folder.strip():
     fp = Path(folder.strip()).expanduser()
     if fp.is_dir():
-        hits = [x for x in sorted(fp.rglob("*.xlsx")) if _is_report_member(x.name)]
+        hits = sorted(x for x in fp.rglob("*")
+                      if x.is_file() and _is_report_member(x.name))
         for x in hits:
-            _add(x.name, x.read_bytes())
+            try:
+                _add(x.name, x.read_bytes())
+            except Exception as exc:  # noqa: BLE001
+                st.sidebar.warning(f"Could not read {x.name}: {exc}")
         st.sidebar.caption(f"📁 {len(hits)} report(s) found in {fp.name}/")
     else:
         st.sidebar.error(f"Not a folder: {fp}")
@@ -358,12 +397,57 @@ for p in parsed:
     for w in p["warnings"]:
         st.warning(f"**{p['report']}**: {w}")
 
-if df_events.empty:
-    st.success("No flagged events in the selected categories.")
-    st.dataframe(df_reports, width="stretch", hide_index=True)
-    st.stop()
-
 df_rollup = ribbon_rollup(df_events, n_reports)
+
+
+def _emit_report():
+    """Build the workbook, auto-save a timestamped copy (once per distinct
+    analysis), and offer the download. Runs in BOTH the has-events and the
+    clean-route (no events) paths so a report is always produced."""
+    st.divider()
+    xlsx = build_export(
+        df_events[["report", "route", "ribbon_num", "tube", "fiber_range",
+                   "splice", "category_label", "text"]],
+        df_rollup, df_reports,
+    )
+
+    def _analysis_signature() -> str:
+        import hashlib
+        key = "|".join(sorted(p["report"] for p in parsed))
+        key += f"::events={len(df_events)}::cats={','.join(sorted(chosen))}"
+        return hashlib.md5(key.encode()).hexdigest()
+
+    if autosave:
+        sig = _analysis_signature()
+        if st.session_state.get("_last_saved_sig") != sig:
+            try:
+                target_dir = Path(out_dir.strip() or str(_default_out_dir())).expanduser()
+                target_dir.mkdir(parents=True, exist_ok=True)
+                saved_path = _unique_path(target_dir / _report_filename())
+                saved_path.write_bytes(xlsx)
+                st.session_state["_last_saved_sig"] = sig
+                st.session_state["_last_saved_path"] = str(saved_path)
+            except Exception as exc:  # noqa: BLE001
+                st.warning(f"Could not auto-save the report: {exc}")
+                report_error(exc, where="auto_save_report",
+                             context={"out_dir": out_dir})
+        if st.session_state.get("_last_saved_path"):
+            st.success(f"📄 Report saved: `{st.session_state['_last_saved_path']}`")
+
+    st.download_button(
+        "⬇️  Download cross-report tracker (.xlsx)",
+        data=xlsx,
+        file_name=_report_filename(),
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+if df_events.empty:
+    st.info("No flagged events in the selected categories — the report below "
+            "records the reports reviewed with a clean result.")
+    st.dataframe(df_reports, width="stretch", hide_index=True)
+    _emit_report()
+    st.stop()
 
 tab_rank, tab_charts, tab_events, tab_reports = st.tabs(
     ["🏆 Ribbon ranking", "📊 Charts", "🔬 All events", "📁 Reports"]
@@ -478,42 +562,4 @@ with tab_reports:
                 st.json(p["summary_stats"])
 
 # ---- export ----
-st.divider()
-xlsx = build_export(
-    df_events[["report", "route", "ribbon_num", "tube", "fiber_range",
-               "splice", "category_label", "text"]],
-    df_rollup, df_reports,
-)
-
-# Auto-save a timestamped report — but only ONCE per distinct analysis, not on
-# every Streamlit rerun (clicks/filters trigger reruns). We fingerprint the
-# inputs + category selection; when that signature changes we write a new file.
-def _analysis_signature() -> str:
-    import hashlib
-    key = "|".join(sorted(p["report"] for p in parsed))
-    key += f"::events={len(df_events)}::cats={','.join(sorted(chosen))}"
-    return hashlib.md5(key.encode()).hexdigest()
-
-if autosave:
-    sig = _analysis_signature()
-    if st.session_state.get("_last_saved_sig") != sig:
-        try:
-            target_dir = Path(out_dir.strip() or str(_default_out_dir())).expanduser()
-            target_dir.mkdir(parents=True, exist_ok=True)
-            saved_path = target_dir / _report_filename()
-            saved_path.write_bytes(xlsx)
-            st.session_state["_last_saved_sig"] = sig
-            st.session_state["_last_saved_path"] = str(saved_path)
-        except Exception as exc:  # noqa: BLE001
-            st.warning(f"Could not auto-save the report: {exc}")
-            report_error(exc, where="auto_save_report",
-                         context={"out_dir": out_dir})
-    if st.session_state.get("_last_saved_path"):
-        st.success(f"📄 Report saved: `{st.session_state['_last_saved_path']}`")
-
-st.download_button(
-    "⬇️  Download cross-report tracker (.xlsx)",
-    data=xlsx,
-    file_name=_report_filename(),
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-)
+_emit_report()

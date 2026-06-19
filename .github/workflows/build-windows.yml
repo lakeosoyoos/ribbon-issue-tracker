@@ -60,6 +60,18 @@ jobs:
         run: |
           python test_ui.py
 
+      # ── FULL CLICK-THROUGH + INGESTION AUDIT ───────────────────────
+      # Exercises every interactive path + the filename edge cases
+      # (unicode/uppercase/.xlsm/duplicate names, junk, corrupt, no-grid,
+      # auto-save, clean route). Runs on Windows too so path/locking
+      # differences are caught before the build.
+      - name: Click-through + ingestion audit
+        shell: pwsh
+        env:
+          PYTHONIOENCODING: utf-8
+        run: |
+          python tests/test_audit.py
+
       # Bake the error-report webhook from the repo SECRET (never committed —
       # public repo, Slack auto-revokes leaked webhooks). Absent -> reporting off.
       - name: Bake error-report webhook (from secret)

@@ -234,10 +234,17 @@ def _read_reburn_summary(wb) -> dict:
     return stats
 
 
-def parse_report(path: str | Path) -> ReportParse:
+def parse_report(path: str | Path, report_name: str | None = None) -> ReportParse:
+    """Parse one report workbook.
+
+    report_name: optional display name. When the caller wrote `data` to a temp
+    file (whose on-disk name is sanitized for the OS), pass the ORIGINAL file
+    name here so the report/route labels reflect the real file — this is what
+    lets us ingest a report regardless of how its filename is structured.
+    """
     path = Path(path)
     wb = openpyxl.load_workbook(path, data_only=True)
-    report_name = path.stem
+    report_name = (report_name or path.stem or "report").strip() or "report"
     route = _route_from_name(report_name)
 
     grid = _find_grid_sheet(wb)
