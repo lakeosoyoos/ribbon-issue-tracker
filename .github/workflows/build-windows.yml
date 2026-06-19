@@ -92,6 +92,36 @@ jobs:
           if (Test-Path dist)  { Remove-Item -Recurse -Force dist  }
           pyinstaller RibbonTracker.spec --noconfirm --clean
 
+      # ── FROZEN PIPELINE SELF-TEST ──────────────────────────────────
+      # /_stcore/health proves only that the SERVER booted. This runs the
+      # exe with RT_SELFTEST=1 so it exercises the real run-time paths INSIDE
+      # the frozen bundle — openpyxl read+write, pandas ExcelWriter, the
+      # parser, and altair->vega->jsonschema->rfc3987 chart rendering — and
+      # exits non-zero (with a logged traceback) on any missing bundled
+      # data file. This is the authoritative "no Windows packaging issues"
+      # gate. (env var is local to this step, so it never leaks into the
+      # boot self-test below.)
+      - name: Frozen pipeline self-test (RT_SELFTEST inside the exe)
+        shell: pwsh
+        run: |
+          $env:RT_SELFTEST = "1"
+          $exe = "dist\RibbonTracker\RibbonTracker.exe"
+          # Windowed (GUI-subsystem) exe -> must -Wait to get the exit code.
+          $p = Start-Process -FilePath $exe -Wait -PassThru
+          $log = Join-Path $env:USERPROFILE ".ribbonTracker\selftest.log"
+          if (Test-Path $log) {
+            Write-Host "----- selftest.log -----"
+            Get-Content $log
+          } else {
+            Write-Error "FROZEN SELF-TEST FAILED — no selftest.log written (exe never ran the self-test)."
+            exit 1
+          }
+          if ($p.ExitCode -ne 0) {
+            Write-Error "FROZEN SELF-TEST FAILED — full pipeline raised inside the frozen exe (exit $($p.ExitCode)). A bundled data file is missing. Release will NOT be updated."
+            exit 1
+          }
+          Write-Host "FROZEN SELF-TEST PASSED."
+
       # ── BOOT SELF-TEST — the authoritative "does it launch" gate ────
       - name: Boot self-test (launch exe, poll /_stcore/health)
         shell: pwsh

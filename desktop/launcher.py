@@ -239,7 +239,106 @@ def _resolve_ui_script(engine_dir: Path) -> str:
     return str(engine_dir / "ribbon_tracker_app.py")
 
 
+def _selftest() -> int:
+    """Exercise the FULL pipeline inside the frozen process and exit 0/1.
+
+    /_stcore/health proves only that the server booted; it never parses a
+    report, renders a chart, or writes the Excel. Those run-time paths pull
+    bundled data files (openpyxl write templates, altair→vega→jsonschema→
+    rfc3987 grammar) that a Windows build can be missing while still serving
+    health=ok. This routine runs every one of them so CI catches a packaging
+    gap before techs do. Writes results to ~/.ribbonTracker/selftest.log and
+    returns the process exit code (the only signal a windowed exe can give)."""
+    log_dir = Path.home() / APP_DIR_NAME
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log = open(log_dir / "selftest.log", "w", buffering=1,
+               encoding="utf-8", errors="replace")
+    sys.stdout = log
+    sys.stderr = log
+
+    def _ok(msg):
+        print(f"[selftest] OK  {msg}")
+
+    try:
+        print(f"=== {APP_NAME} self-test {time.strftime('%Y-%m-%d %H:%M:%S')} ===")
+        print(f"frozen={getattr(sys, 'frozen', False)}  python={sys.version.split()[0]}")
+
+        # make the bundled engine importable
+        sys.path.insert(0, str(_bundled_dir()))
+
+        import io
+        import tempfile
+        import importlib
+
+        import numpy as np            # noqa: F401
+        import pandas as pd
+        import altair as alt
+        import openpyxl
+        from openpyxl.styles import PatternFill
+        _ok("imports: numpy / pandas / altair / openpyxl")
+
+        ribbon_parser = importlib.import_module("ribbon_parser")
+        _ok("import: ribbon_parser (bundled engine)")
+
+        # 1) openpyxl WRITE: build a synthetic report workbook
+        tmp = Path(tempfile.mkdtemp(prefix="rt_selftest_"))
+        rep = tmp / "report.xlsx"
+        wb = openpyxl.Workbook()
+        wb.active.title = "Acquisition Parameters"
+        sr = wb.create_sheet("Splice Report")
+        sr.cell(3, 1, "Ribbon"); sr.cell(3, 3, "Splice 1"); sr.cell(3, 5, "Splice 2")
+        sr.cell(4, 1, "Fiber 1-12 (1) (A1)")
+        sr.cell(5, 1, "Fiber 13-24 (2) (A2)")
+        c = sr.cell(4, 3, "5 .312"); c.fill = PatternFill("solid", fgColor="FFC7CE")
+        c = sr.cell(5, 5, "20 BEND .1 bidi"); c.fill = PatternFill("solid", fgColor="FFEB3B")
+        wb.create_sheet("Legend")
+        wb.save(rep)
+        _ok("openpyxl write")
+
+        # 2) parser READ + classify
+        rp = ribbon_parser.parse_report(str(rep), report_name="Self Test Route")
+        assert rp.grid_sheet == "Splice Report", rp.grid_sheet
+        assert len(rp.events) == 2, [e.text for e in rp.events]
+        _ok(f"parse_report: {len(rp.events)} events, grid={rp.grid_sheet!r}")
+
+        # 3) pandas roll-up
+        df = pd.DataFrame([e.as_row() for e in rp.events])
+        g = df.groupby("ribbon_num").size()
+        assert int(g.sum()) == 2
+        _ok("pandas groupby roll-up")
+
+        # 4) pandas + openpyxl WRITE path (the export)
+        out_xlsx = tmp / "out.xlsx"
+        with pd.ExcelWriter(out_xlsx, engine="openpyxl") as xl:
+            df.to_excel(xl, sheet_name="All Events", index=False)
+        assert out_xlsx.exists() and out_xlsx.stat().st_size > 0
+        # read it back to be sure the written file is valid
+        openpyxl.load_workbook(out_xlsx)
+        _ok("pandas->openpyxl ExcelWriter + reread")
+
+        # 5) altair -> vega spec (exercises jsonschema / rfc3987 grammar)
+        chart = alt.Chart(df).mark_bar().encode(
+            x="ribbon_num:N", y="count():Q")
+        spec = chart.to_dict()
+        assert isinstance(spec, dict) and spec.get("mark")
+        _ok("altair chart.to_dict() (vega/jsonschema/rfc3987)")
+
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+        print("=== SELF-TEST PASSED ===")
+        return 0
+    except BaseException as exc:  # noqa: BLE001
+        import traceback
+        print("=== SELF-TEST FAILED ===")
+        print(f"{type(exc).__name__}: {exc}")
+        print(traceback.format_exc())
+        return 1
+
+
 def main() -> int:
+    if "--selftest" in sys.argv or os.environ.get("RT_SELFTEST"):
+        return _selftest()
+
     _redirect_output_to_log()
     _silence_first_run_prompt()
     _load_webhook()
