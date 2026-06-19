@@ -39,13 +39,29 @@ ERROR REPORTING
   desktop/_webhook.cfg, which the spec bundles only if present. No secret ->
   reporting ships OFF. NEVER commit _webhook.cfg (it's gitignored).
 
-CI GATES (run before the PyInstaller build, fail fast)
+CI GATES
+  Before the build (source-level, fail fast):
   1. tests/test_parse.py — synthetic report -> parser finds the grid sheet,
      parses ribbons/tubes, classifies a reburn + a bend.
   2. test_ui.py — PORT==8512 guard; AppTest landing page 0 exceptions; folder
      roll-up produces 2 reports + a repeat-offender callout.
-  3. BOOT SELF-TEST — launch the exe, poll /_stcore/health=ok within 90s, else
-     the Release is NOT updated (a DOA build can't reach techs).
+  3. tests/test_audit.py — 22-check click-through + ingestion audit (weird
+     filenames, junk skip, corrupt/no-grid no-crash, duplicate names,
+     tabs/filters, auto-save dedup/clean/off).
+
+  After the build (frozen-bundle, the real Windows packaging proof):
+  4. FROZEN PIPELINE SELF-TEST — run the .exe with RT_SELFTEST=1; it exercises
+     openpyxl read+write, the parser, pandas ExcelWriter, and altair->vega->
+     jsonschema->rfc3987 chart rendering INSIDE the bundle and exits non-zero
+     (with a logged traceback in ~/.ribbonTracker/selftest.log) on any missing
+     bundled data file. This is what catches a Windows packaging gap that
+     /_stcore/health would miss.
+  5. BOOT SELF-TEST — launch the exe, poll /_stcore/health=ok within 90s, then
+     scan the launcher log for tracebacks. On any failure the Release is NOT
+     updated (a DOA build can't reach techs).
+
+  To run the frozen self-test locally:  RT_SELFTEST=1 RibbonTracker(.exe)
+  (or the Mac binary inside RibbonTracker.app/Contents/MacOS/).
 
 MAC GATEKEEPER (unsigned build)
   First run on a fresh Mac: right-click RibbonTracker.app -> Open -> Open, or
