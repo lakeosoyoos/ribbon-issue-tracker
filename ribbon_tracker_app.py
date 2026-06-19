@@ -1,0 +1,450 @@
+"""
+Ribbon Issue Tracker  (Streamlit)
+=================================
+Drop in one or many EXFO-style reburn / splice report workbooks.  The app finds
+the detailed ribbon x splice grid in each (handling multi-sheet workbooks),
+extracts every flagged event, and rolls them up ACROSS all loaded reports to
+answer: which ribbons / tube positions are more likely to have issues?
+
+Run:  streamlit run ribbon_tracker_app.py --server.port 8512
+"""
+
+from __future__ import annotations
+
+import io
+import os
+import subprocess
+import sys
+import tempfile
+import zipfile
+from pathlib import Path
+
+import altair as alt
+import pandas as pd
+import streamlit as st
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Engine import — auto-update aware (mirrors SpliceReport desktop_app.py)
+# ─────────────────────────────────────────────────────────────────────────────
+# The launcher sets RT_ENGINE_DIR when it has downloaded + validated a fresh
+# engine into ~/.ribbonTracker/engine. If set, prepend it so `import
+# ribbon_parser` resolves to the freshly-downloaded copy; otherwise fall back
+# to the bundled copy next to the frozen exe (or alongside this file in dev).
+_ENGINE_DIR = os.environ.get("RT_ENGINE_DIR")
+if _ENGINE_DIR and os.path.isdir(_ENGINE_DIR):
+    sys.path.insert(0, _ENGINE_DIR)
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(_HERE)
+for _p in (_HERE, _REPO_ROOT):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from ribbon_parser import CATEGORIES, parse_report  # noqa: E402
+
+try:  # error reporting is best-effort; never let its absence break the app
+    from error_reporter import report_error
+except Exception:  # noqa: BLE001
+    def report_error(exc, where="", context=None):  # type: ignore
+        return None
+
+st.set_page_config(page_title="Ribbon Issue Tracker", page_icon="🎗️", layout="wide")
+
+# Categories considered "needs-action" for the headline ribbon ranking.
+ACTION_CATS = {"reburn_ab", "break", "ref", "launch", "bend", "gainer"}
+
+
+# --------------------------------------------------------------------------- #
+# Input helpers
+# --------------------------------------------------------------------------- #
+def _is_report_member(name: str) -> bool:
+    """A real .xlsx inside a zip / folder (skip Excel lock files & macOS junk)."""
+    base = name.rsplit("/", 1)[-1]
+    return (
+        name.lower().endswith(".xlsx")
+        and not base.startswith("~$")
+        and "__MACOSX" not in name
+        and not base.startswith(".")
+    )
+
+
+def _xlsx_from_zip(zip_bytes: bytes) -> list[tuple[str, bytes]]:
+    """Extract every report .xlsx from a zip (recurses into nested folders)."""
+    out = []
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        for info in zf.infolist():
+            if info.is_dir() or not _is_report_member(info.filename):
+                continue
+            out.append((info.filename.rsplit("/", 1)[-1], zf.read(info)))
+    return out
+
+
+def pick_folder_native() -> str:
+    """Open the native macOS / OS folder chooser (works because this is a
+    LOCAL desktop app). Runs tkinter in a short-lived subprocess so it never
+    fights Streamlit's own event loop. Returns '' if cancelled/unavailable."""
+    code = (
+        "import tkinter as tk;"
+        "from tkinter import filedialog;"
+        "r=tk.Tk();r.withdraw();r.attributes('-topmost',True);"
+        "print(filedialog.askdirectory());r.destroy()"
+    )
+    try:
+        res = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True, text=True, timeout=120,
+        )
+        return res.stdout.strip()
+    except Exception:
+        return ""
+
+
+# --------------------------------------------------------------------------- #
+# Parsing (cached on file bytes so re-runs are instant)
+# --------------------------------------------------------------------------- #
+@st.cache_data(show_spinner=False)
+def _parse_bytes(name: str, data: bytes) -> dict:
+    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=True) as tf:
+        tf.write(data)
+        tf.flush()
+        rp = parse_report(tf.name)
+    return {
+        "report": rp.report,
+        "route": rp.route,
+        "grid_sheet": rp.grid_sheet,
+        "sheets": rp.sheets,
+        "n_ribbons": rp.n_ribbons,
+        "n_splice_cols": rp.n_splice_cols,
+        "warnings": rp.warnings,
+        "summary_stats": rp.summary_stats,
+        "events": [e.as_row() for e in rp.events],
+    }
+
+
+def events_dataframe(parsed: list[dict]) -> pd.DataFrame:
+    rows = []
+    for p in parsed:
+        for e in p["events"]:
+            rows.append(e)
+    if not rows:
+        return pd.DataFrame(
+            columns=["report", "route", "ribbon_num", "tube", "fiber_range",
+                     "splice", "category", "category_label", "text"]
+        )
+    df = pd.DataFrame(rows)
+    df["ribbon_num"] = df["ribbon_num"].astype("Int64")
+    return df
+
+
+# --------------------------------------------------------------------------- #
+# Cross-report ribbon roll-up
+# --------------------------------------------------------------------------- #
+def ribbon_rollup(df: pd.DataFrame, n_reports: int) -> pd.DataFrame:
+    """One row per ribbon number, aggregated across every loaded report."""
+    if df.empty:
+        return df
+
+    # representative tube per ribbon (mode)
+    tube_map = (
+        df.dropna(subset=["tube"])
+        .groupby("ribbon_num")["tube"]
+        .agg(lambda s: s.value_counts().index[0])
+    )
+
+    g = df.groupby("ribbon_num")
+    out = pd.DataFrame({
+        "ribbon": g.size().index,
+        "tube": [tube_map.get(rb, "") for rb in g.size().index],
+        "total_events": g.size().values,
+        "reports_flagged": g["report"].nunique().values,
+        "action_events": g.apply(
+            lambda x: int(x["category"].isin(ACTION_CATS).sum()), include_groups=False
+        ).values,
+    })
+    out["pct_of_reports"] = (out["reports_flagged"] / max(n_reports, 1) * 100).round(1)
+
+    # per-category counts
+    cat_pivot = (
+        df.pivot_table(index="ribbon_num", columns="category",
+                       values="text", aggfunc="count", fill_value=0)
+    )
+    for cat in CATEGORIES:
+        if cat in cat_pivot.columns:
+            out[cat] = out["ribbon"].map(cat_pivot[cat]).fillna(0).astype(int)
+
+    out = out.rename(columns={"ribbon": "ribbon_num"})
+    out = out.sort_values(
+        ["reports_flagged", "action_events", "total_events"],
+        ascending=False
+    ).reset_index(drop=True)
+    out.insert(0, "rank", range(1, len(out) + 1))
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Excel export
+# --------------------------------------------------------------------------- #
+def build_export(df_events, df_rollup, df_reports) -> bytes:
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xl:
+        df_rollup.to_excel(xl, sheet_name="Ribbon Ranking", index=False)
+        df_events.to_excel(xl, sheet_name="All Events", index=False)
+        df_reports.to_excel(xl, sheet_name="Reports Loaded", index=False)
+    return buf.getvalue()
+
+
+# --------------------------------------------------------------------------- #
+# UI
+# --------------------------------------------------------------------------- #
+st.title("🎗️ Ribbon Issue Tracker")
+st.caption(
+    "Load one or more reburn / splice reports. The app finds each report's "
+    "ribbon × splice grid and ranks which ribbons (tube positions) are most "
+    "often flagged across all loaded reports."
+)
+
+if "folder_path" not in st.session_state:
+    st.session_state.folder_path = ""
+
+with st.sidebar:
+    st.header("Reports")
+    _src = os.environ.get("RT_ENGINE_SOURCE")
+    if _src:
+        st.caption(f"Engine: {_src}")
+    uploads = st.file_uploader(
+        "Drop report files — .xlsx and/or a .zip of reports",
+        type=["xlsx", "zip"], accept_multiple_files=True,
+        help="Select several .xlsx files at once, or a single .zip containing "
+             "a folder of reports (nested folders are searched too).",
+    )
+
+    st.markdown("**…or load a folder on this Mac**")
+    bcol, _ = st.columns([1, 1])
+    if bcol.button("📂 Browse…", use_container_width=True):
+        chosen_dir = pick_folder_native()
+        if chosen_dir:
+            st.session_state.folder_path = chosen_dir
+    folder = st.text_input(
+        "Folder path", key="folder_path",
+        placeholder="/Users/you/Desktop/Reports",
+        help="Every .xlsx in this folder (and its subfolders) is loaded. "
+             "The Browse button fills this in for you.",
+    )
+
+    st.divider()
+    cat_labels = {k: v for k, v in CATEGORIES.items()}
+    chosen = st.multiselect(
+        "Issue categories to include",
+        options=list(CATEGORIES.keys()),
+        default=list(CATEGORIES.keys()),
+        format_func=lambda k: cat_labels[k],
+    )
+
+# ---- gather inputs ----
+inputs: list[tuple[str, bytes]] = []
+seen = set()
+
+def _add(name: str, data: bytes):
+    if name in seen:
+        return
+    inputs.append((name, data))
+    seen.add(name)
+
+for uf in uploads or []:
+    if uf.name.lower().endswith(".zip"):
+        members = _xlsx_from_zip(uf.getvalue())
+        if not members:
+            st.sidebar.warning(f"No .xlsx reports found inside {uf.name}")
+        for mname, mdata in members:
+            _add(mname, mdata)
+    else:
+        _add(uf.name, uf.getvalue())
+
+if folder.strip():
+    fp = Path(folder.strip()).expanduser()
+    if fp.is_dir():
+        hits = [x for x in sorted(fp.rglob("*.xlsx")) if _is_report_member(x.name)]
+        for x in hits:
+            _add(x.name, x.read_bytes())
+        st.sidebar.caption(f"📁 {len(hits)} report(s) found in {fp.name}/")
+    else:
+        st.sidebar.error(f"Not a folder: {fp}")
+
+if not inputs:
+    st.info("⬅️  Add at least one report to begin.")
+    st.stop()
+
+# ---- parse ----
+parsed = []
+for name, data in inputs:
+    try:
+        parsed.append(_parse_bytes(name, data))
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Failed to read **{name}**: {exc}")
+        report_error(exc, where="parse_report",
+                     context={"n_bytes": len(data),
+                              "ext": Path(name).suffix.lower()})
+
+if not parsed:
+    st.stop()
+
+n_reports = len(parsed)
+df_events_all = events_dataframe(parsed)
+df_events = df_events_all[df_events_all["category"].isin(chosen)].copy()
+
+# ---- reports-loaded table ----
+df_reports = pd.DataFrame([{
+    "report": p["report"],
+    "route": p["route"],
+    "grid_sheet": p["grid_sheet"],
+    "ribbons": p["n_ribbons"],
+    "splice_cols": p["n_splice_cols"],
+    "events": len(p["events"]),
+    "sheets": ", ".join(p["sheets"]),
+    "warnings": "; ".join(p["warnings"]),
+} for p in parsed])
+
+# ---- headline metrics ----
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Reports loaded", n_reports)
+c2.metric("Total flagged events", len(df_events))
+ribbons_with_issue = df_events["ribbon_num"].nunique()
+c3.metric("Ribbons with ≥1 issue", int(ribbons_with_issue))
+action_n = int(df_events["category"].isin(ACTION_CATS).sum())
+c4.metric("Action events", action_n, help="Reburn, break, ref, launch, bend, gainer")
+
+for p in parsed:
+    for w in p["warnings"]:
+        st.warning(f"**{p['report']}**: {w}")
+
+if df_events.empty:
+    st.success("No flagged events in the selected categories.")
+    st.dataframe(df_reports, width="stretch", hide_index=True)
+    st.stop()
+
+df_rollup = ribbon_rollup(df_events, n_reports)
+
+tab_rank, tab_charts, tab_events, tab_reports = st.tabs(
+    ["🏆 Ribbon ranking", "📊 Charts", "🔬 All events", "📁 Reports"]
+)
+
+# ---- ranking tab ----
+with tab_rank:
+    st.subheader("Which ribbons are most often flagged?")
+    st.caption(
+        "Ranked by number of reports the ribbon was flagged in, then action "
+        "events, then total events. Tube code (A1, K1…) is the physical "
+        "position — repeat offenders across routes point to a systematic cause."
+    )
+    repeat = df_rollup[df_rollup["reports_flagged"] > 1]
+    if not repeat.empty:
+        tubes = ", ".join(
+            f"Ribbon {int(r.ribbon_num)} ({r.tube})" for r in repeat.itertuples()
+        )
+        st.info(f"🔁 **Repeat offenders** (flagged in >1 report): {tubes}")
+
+    show_cats = [c for c in CATEGORIES if c in df_rollup.columns]
+    nice = {
+        "rank": "Rank", "ribbon_num": "Ribbon", "tube": "Tube",
+        "reports_flagged": "Reports", "pct_of_reports": "% reports",
+        "total_events": "Events", "action_events": "Action",
+        **{c: CATEGORIES[c] for c in show_cats},
+    }
+    cols = ["rank", "ribbon_num", "tube", "reports_flagged", "pct_of_reports",
+            "total_events", "action_events"] + show_cats
+    st.dataframe(
+        df_rollup[cols].rename(columns=nice),
+        width="stretch", hide_index=True,
+        column_config={
+            "% reports": st.column_config.NumberColumn(format="%.1f%%"),
+        },
+    )
+
+# ---- charts tab ----
+with tab_charts:
+    left, right = st.columns(2)
+    with left:
+        st.markdown("**Events per ribbon**")
+        bar = (
+            alt.Chart(df_rollup)
+            .mark_bar()
+            .encode(
+                x=alt.X("total_events:Q", title="Flagged events"),
+                y=alt.Y("ribbon_num:N", sort="-x", title="Ribbon"),
+                color=alt.Color("reports_flagged:Q", title="Reports",
+                                scale=alt.Scale(scheme="reds")),
+                tooltip=["ribbon_num", "tube", "total_events",
+                         "reports_flagged", "action_events"],
+            )
+            .properties(height=max(300, 18 * len(df_rollup)))
+        )
+        st.altair_chart(bar, use_container_width=True)
+    with right:
+        st.markdown("**Ribbon × issue category (heatmap)**")
+        long = df_events.groupby(["ribbon_num", "category_label"]).size().reset_index(name="n")
+        heat = (
+            alt.Chart(long)
+            .mark_rect()
+            .encode(
+                x=alt.X("category_label:N", title="", axis=alt.Axis(labelAngle=-40)),
+                y=alt.Y("ribbon_num:N", title="Ribbon"),
+                color=alt.Color("n:Q", title="Events", scale=alt.Scale(scheme="oranges")),
+                tooltip=["ribbon_num", "category_label", "n"],
+            )
+            .properties(height=max(300, 18 * df_events["ribbon_num"].nunique()))
+        )
+        st.altair_chart(heat, use_container_width=True)
+
+    st.markdown("**Issue mix across all reports**")
+    mix = df_events.groupby("category_label").size().reset_index(name="n").sort_values("n")
+    st.altair_chart(
+        alt.Chart(mix).mark_bar().encode(
+            x=alt.X("n:Q", title="Events"),
+            y=alt.Y("category_label:N", sort="-x", title=""),
+            tooltip=["category_label", "n"],
+        ).properties(height=240),
+        use_container_width=True,
+    )
+
+# ---- events tab ----
+with tab_events:
+    st.subheader("Every flagged event")
+    fc1, fc2 = st.columns(2)
+    routes = ["(all)"] + sorted(df_events["route"].unique().tolist())
+    pick_route = fc1.selectbox("Route", routes)
+    pick_cat = fc2.multiselect(
+        "Category", [CATEGORIES[c] for c in CATEGORIES if c in df_events["category"].unique()]
+    )
+    view = df_events
+    if pick_route != "(all)":
+        view = view[view["route"] == pick_route]
+    if pick_cat:
+        view = view[view["category_label"].isin(pick_cat)]
+    st.dataframe(
+        view[["report", "route", "ribbon_num", "tube", "fiber_range",
+              "splice", "category_label", "text"]]
+        .rename(columns={"ribbon_num": "ribbon", "category_label": "category"}),
+        width="stretch", hide_index=True,
+    )
+
+# ---- reports tab ----
+with tab_reports:
+    st.subheader("Reports loaded")
+    st.dataframe(df_reports, width="stretch", hide_index=True)
+    for p in parsed:
+        if p["summary_stats"]:
+            with st.expander(f"Tech's Reburn Summary — {p['report']}"):
+                st.json(p["summary_stats"])
+
+# ---- export ----
+st.divider()
+xlsx = build_export(
+    df_events[["report", "route", "ribbon_num", "tube", "fiber_range",
+               "splice", "category_label", "text"]],
+    df_rollup, df_reports,
+)
+st.download_button(
+    "⬇️  Download cross-report tracker (.xlsx)",
+    data=xlsx,
+    file_name="ribbon_issue_tracker.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+)

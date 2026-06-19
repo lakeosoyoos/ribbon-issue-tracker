@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# PyInstaller build output
+desktop/build/
+desktop/dist/
+build/
+dist/
+*.spec.bak
+
+# Error-report webhook — NEVER commit (CI writes it from the repo secret)
+desktop/_webhook.cfg
+_webhook.cfg
+
+# OS junk
+.DS_Store
+
+# Local launch config (machine-specific)
+.claude/
